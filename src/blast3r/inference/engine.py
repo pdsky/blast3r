@@ -10,6 +10,86 @@ from blast3r.extensions.cujac import exp_se3, compute_residuals_with_rigs as res
 from .ba_solver import GaussNewtonSolver
 
 
+# soft prior on camera centres (e.g. GNSS / LIO positions)
+
+def _skew(v):
+    """(M, 3) -> (M, 3, 3) cross-product matrices."""
+    O = torch.zeros_like(v[:, 0])
+    return torch.stack((torch.stack((O, -v[:, 2], v[:, 1]), -1),
+                        torch.stack((v[:, 2], O, -v[:, 0]), -1),
+                        torch.stack((-v[:, 1], v[:, 0], O), -1)), -2)
+
+
+def _umeyama_sim3(src, dst):
+    """(s, R, t) minimising ||dst - (s R src + t)||, for (M, 3) point sets."""
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    xs, xd = src - mu_s, dst - mu_d
+    U, D, Vt = torch.linalg.svd(xd.T @ xs / len(src))
+    S = torch.ones(3, dtype=src.dtype, device=src.device)
+    S[2] = torch.sign(torch.linalg.det(U @ Vt))
+    R = U @ torch.diag(S) @ Vt
+    s = (D * S).sum() / xs.pow(2).sum(1).mean()
+    return s, R, mu_d - s * R @ mu_s
+
+
+class PositionPrior:
+    """Soft prior on camera centres that leaves BLASt3R's gauge free.
+
+    For each constrained image i, r_i = (s R c_i + t - p_i) / sigma, with c_i the camera centre, p_i
+    the prior position (metres, any Cartesian frame) and (s, R, t) the least-squares Sim(3) from the
+    current centres to the priors. The Sim(3) is refitted at the start of every LM step and held
+    fixed within it, so the prior constrains the shape and scale consistency of the trajectory
+    (drift) without moving the reconstruction's own frame or scale; the last Sim(3) is what maps the
+    reconstruction into the prior frame.
+    """
+
+    def __init__(self, img_ids, positions, sigma):
+        """sigma: one std [m] for all images, or one per image (e.g. scaled with each image's observation count)."""
+        assert len(img_ids) == len(positions) and len(img_ids) >= 3
+        self.img_ids = torch.as_tensor(img_ids, dtype=torch.long)
+        self.positions = torch.as_tensor(positions, dtype=torch.float64)
+        self.sigma = torch.as_tensor(sigma, dtype=torch.float64).reshape(-1)
+        assert len(self.sigma) in (1, len(img_ids))
+
+    def _sig(self, like, ndim):
+        """sigma broadcastable against a (M, ...) tensor with ndim dimensions."""
+        return self.sigma.to(like.device).reshape((-1,) + (1,) * (ndim - 1))
+
+    def _centres(self, rigs, P_rig2cam, P_w2rig):
+        """Nodes, world->rig rotations, camera centres in the rig and in the world, for the priors."""
+        img_ids = self.img_ids.to(P_w2rig.device)
+        node = rigs[1].long()[img_ids]
+        cam = rigs[2].long()[img_ids]
+        Q = P_rig2cam[cam].double()
+        o = -Q[:, :3, :3].transpose(1, 2) @ Q[:, :3, 3:]  # camera centre in the rig frame
+        P = P_w2rig[node].double()
+        R, t = P[:, :3, :3], P[:, :3, 3:]
+        c = (R.transpose(1, 2) @ (o - t)).squeeze(-1)
+        return node, R, o.squeeze(-1), c
+
+    def fit(self, rigs, P_rig2cam, P_w2rig):
+        _, _, _, c = self._centres(rigs, P_rig2cam, P_w2rig)
+        return _umeyama_sim3(c, self.positions.to(c.device))
+
+    def residuals(self, rigs, P_rig2cam, P_w2rig, sim3):
+        s, Rs, ts = sim3
+        _, _, _, c = self._centres(rigs, P_rig2cam, P_w2rig)
+        return (s * c @ Rs.T + ts - self.positions.to(c.device)) / self._sig(c, 2)
+
+    def normal_terms(self, rigs, P_rig2cam, P_w2rig, sim3):
+        """Per-image (node, H = JᵀJ, g = Jᵀr), J = dr/d[w, v] for P_w2rig <- exp_se3([w, v]) @ P_w2rig,
+        the perturbation whose negative the LM update applies."""
+        s, Rs, ts = sim3
+        node, R, o, c = self._centres(rigs, P_rig2cam, P_w2rig)
+        r = (s * c @ Rs.T + ts - self.positions.to(c.device)) / self._sig(c, 2)
+        Rt = R.transpose(1, 2)
+        J = torch.cat((Rt @ _skew(o), -Rt), dim=2)  # dc/d[w, v], (M, 3, 6)
+        J = (s / self._sig(c, 3)) * Rs @ J
+        H = J.transpose(1, 2) @ J
+        g = (J.transpose(1, 2) @ r.unsqueeze(-1)).squeeze(-1)
+        return node, H, g
+
+
 # tangent regularization on dense (log-)depth maps
 
 def _dense_tangent_prior_terms(
@@ -216,6 +296,8 @@ def lm_step( rigs, pids, pix2d, pix2d_std, pix2d_dep,
              # tangent prior (dense) on the combined depth vs main depth (channel 0)
              log_depth_maps=None, conf=None, pts3d_ref=None, weight_tan=0.0, tan_stride=4,
              normalize_tangents=True,
+             # soft prior on camera centres (PositionPrior), None to disable
+             pos_prior=None,
              optim_K=True, optim_Z=True, optim_P=True, optim_X=True, optim_Z0=True, **ba_options):
     """Levenberg-Marquardt step.
 
@@ -260,6 +342,9 @@ def lm_step( rigs, pids, pix2d, pix2d_std, pix2d_dep,
     # This avoids needing cross-derivatives w.r.t. K (we only add GN terms for z_coefs).
     K_tan = K.detach()
 
+    # The prior's Sim(3) to the prior frame is refitted here and held fixed within the step.
+    prior_sim3 = pos_prior.fit(rigs, P_rig2cam, P_w2rig) if pos_prior is not None else None
+
     def objective(K, P_w2rig, pts3d, z_coefs):
         residuals_, err_pts_, w_pts_ = residual_func(
             rigs, K, P_rig2cam, P_w2rig, z_coefs, pts3d, pids, pix2d, pix2d_std, pix2d_dep, is_depth_log,
@@ -274,6 +359,12 @@ def lm_step( rigs, pids, pix2d, pix2d_std, pix2d_dep,
                 normalize_tangents=bool(normalize_tangents)
             )
             loss = loss + tan_loss
+
+        if pos_prior is not None:
+            # err_pts_ is pnorm/2 * W r² per component, averaged over 3 * n_obs components, while the
+            # normal equations sum W r²: weigh the prior's r² the same way so both stay consistent
+            r_p = pos_prior.residuals(rigs, P_rig2cam, P_w2rig, prior_sim3)
+            loss = loss + (0.5 * pnorm * r_p.pow(2).sum() / (3 * n_obs)).to(loss.dtype)
 
         return loss, residuals_, w_pts_
 
@@ -299,7 +390,8 @@ def lm_step( rigs, pids, pix2d, pix2d_std, pix2d_dep,
                               optim_K = optim_K, optim_Z = optim_Z, optim_Z0=optim_Z0,
                               optim_P = optim_P, optim_X = optim_X,
                               is_depth_log=is_depth_log)
-    delta = jac.solve_delta(J, init_residuals, w_pts, z_prior=z_prior)
+    p_prior = pos_prior.normal_terms(rigs, P_rig2cam, P_w2rig, prior_sim3) if pos_prior is not None else None
+    delta = jac.solve_delta(J, init_residuals, w_pts, z_prior=z_prior, p_prior=p_prior)
     delta_K, delta_P, delta_zcf, delta_pts = jac.unpack_delta_inplace(delta)
 
     # Update the parameters.

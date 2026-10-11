@@ -107,7 +107,7 @@ class GaussNewtonSolver:
         else:
             raise ValueError(f'bad {status=}')
 
-    def solve_delta(self, J, residuals, w_pts, clamp_w=(1e-6, 1e6), z_prior=None):
+    def solve_delta(self, J, residuals, w_pts, clamp_w=(1e-6, 1e6), z_prior=None, p_prior=None):
         """Solve for delta = - (Jᵀ W J)⁻¹ Jᵀ W r, i.e. (Jᵀ W J) delta = - Jᵀ W r.
 
         Using the Schur complement:
@@ -172,6 +172,11 @@ class GaussNewtonSolver:
                     # silently corrupting shapes.
                     raise TypeError(f"Unsupported JTJ.A type for z_prior: {type(JTJ.A)}")
 
+        # optional prior on camera centres, on the pose (tau) block only.
+        # p_prior is a tuple (node_ids, H_p, g_p), one entry per constrained image:
+        #   node_ids: (M,) node of each image, H_p: (M, N_TAU, N_TAU), g_p: (M, N_TAU)
+        if p_prior is not None:
+            self._add_pose_prior(JTJ, JTr, *p_prior)
 
         # dampen matrices to stabilize solutions (Levenberg-Marquardt)
         JTJ.dampen_(self.dampen, times_max_diag=self.adaptive_dampen)
@@ -224,6 +229,33 @@ class GaussNewtonSolver:
 
         # combine into the full update vector
         return delta_c, delta_p.ravel()
+
+    def _add_pose_prior(self, JTJ, JTr, node_ids, H_p, g_p):
+        # JᵀJ nests as [[[foc, tau], z], pts]: the tau-tau block is JTJ.A.A.D
+        cam_block = JTJ._A._A if isinstance(JTJ._A, SchurMatrix) else None
+        if not isinstance(cam_block, SchurMatrix):
+            raise TypeError(f"Unsupported JᵀJ layout for p_prior: {type(JTJ._A)}")
+        tau = cam_block._D
+        if isinstance(tau, ZerosMat):
+            return  # poses are not optimized
+        if not isinstance(tau, BlockDiagMat):
+            raise TypeError(f"Unsupported tau-tau block type for p_prior: {type(tau)}")
+
+        node_ids = node_ids.to(self.device).long()
+        if self.nodes.true_idxs is not None:  # some poses are frozen: map to the optimized ones
+            lut = torch.full((self.nodes.true_n,), -1, dtype=torch.long, device=self.device)
+            lut[self.nodes.true_idxs] = torch.arange(self.nodes.n, device=self.device)
+            node_ids = lut[node_ids]
+        keep = node_ids >= 0
+        node_ids, H_p, g_p = node_ids[keep], H_p[keep].to(self.dtype), g_p[keep].to(self.dtype)
+        if len(node_ids) == 0:
+            return
+
+        assert tau._blocks.shape == (self.nodes.n, N_TAU, N_TAU), f"bad tau block {tau._blocks.shape}"
+        tau._blocks.index_add_(0, node_ids, H_p.to(tau._blocks.dtype))
+        g = torch.zeros((self.nodes.n, N_TAU), dtype=JTr.dtype, device=JTr.device).index_add_(0, node_ids, g_p.to(JTr.dtype))
+        start_p = self.cams.n * N_FOC
+        JTr[start_p:start_p + self.nodes.n * N_TAU] += g.reshape(-1)
 
     def unpack_delta_inplace(self, delta):
         sizes = [self.cams.n * N_FOC, self.nodes.n * N_TAU, self.imgs.n * self.n_zcf, self.tracks.n * 3]

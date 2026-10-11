@@ -35,7 +35,9 @@ def compute_pts3d_multidepths(model, views):
     with autocast(device_type=model.device.type, dtype=model.force_dtype, enabled=(model.force_dtype != torch.float32)):
         for i in range(n_imgs):
             pred = model({k: v[i:i+1].unsqueeze(1) for k, v in batched_views.items()}, step=0)
-            preds.append(pred[0]) # MonoDepth returns one dict per view
+            # MonoDepth returns one dict per view; keep only the outputs used below so the rest of the
+            # dict (intermediate features) is freed per image instead of piling up on the GPU (8 GB cards)
+            preds.append({k: pred[0][k] for k in ('query_pts3d', 'query_pts3d_conf', 'query_pts3d_raw')})
 
     depth_mode = 'log_multidepth'
     pts3d = [pred['query_pts3d'][..., :3].squeeze(0) for pred in preds]

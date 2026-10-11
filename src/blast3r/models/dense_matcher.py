@@ -1,5 +1,6 @@
 # Copyright (C) 2026-present Naver Corporation. All rights reserved.
 
+import os
 import torch
 import torch.nn as nn
 
@@ -147,7 +148,7 @@ class Dot (DenseMatcher):
             matching_with_null = torch.cat((matching, score_thr.expand(len(matching),self.patch_size**2,1)), dim=-1)
         else:
             # optimizing memory for eval
-            CHUNK = 1024
+            CHUNK = int(os.environ.get('BLAST3R_MATCH_CHUNK') or 0) or 1024  # smaller = lower peak GPU memory, same result
 
             matching_with_null = []
             for idx in range(0, max(1,len(db_desc)), CHUNK): # max(1,) just in case there are zeros pairs
@@ -264,6 +265,13 @@ class DotViT2Mlp (DotMlp):
         db_desc = self._gather_descs(db_tokens,           b_idxs, hw) # (B, ps**2, d)
         qy_desc = self._gather_descs(output_query_tokens, q_idxs, hw) # (B, ps**2, d)
 
+        # local patch: with BLAST3R_MATCH_CHUNK set, run the per-pair head (pair MLP, pixel descriptors, dot
+        # matching) in chunks of pairs; every op is row-wise, so the result is the same with a lower peak memory
+        chunk = int(os.environ.get('BLAST3R_MATCH_CHUNK') or 0)
+        if chunk and len(db_desc) > chunk:
+            parts = [self._pair_head(db_desc[i:i+chunk], qy_desc[i:i+chunk]) for i in range(0, len(db_desc), chunk)]
+            return b_idxs, q_idxs, tuple(map(torch.cat, zip(*parts)))
+
         if self.last_mlp: # make them interact
             db_qy_desc = torch.cat((db_desc, qy_desc), dim=-1)
             db_qy_desc = db_qy_desc + self.pair_mlp(self.pair_norm(db_qy_desc))
@@ -276,5 +284,14 @@ class DotViT2Mlp (DotMlp):
         matching_with_null = self._dot_append_null_to_matching(db_desc, qy_desc)
 
         return b_idxs, q_idxs, matching_with_null # (n, ps**2, ps**2+1)
+
+    def _pair_head(self, db_desc, qy_desc):
+        """Pair MLP + pixel descriptors + dot matching for a chunk of pairs (same steps as the end of forward_ex)."""
+        if self.last_mlp:
+            db_qy_desc = torch.cat((db_desc, qy_desc), dim=-1)
+            db_qy_desc = db_qy_desc + self.pair_mlp(self.pair_norm(db_qy_desc))
+            db_desc, qy_desc = db_qy_desc.tensor_split([self.dec_dim], dim=-1)
+        db_desc, qy_desc = map(self._pixel_descs, (db_desc, qy_desc))
+        return self._dot_append_null_to_matching(db_desc, qy_desc)
 
 class DenseDotViT2Mlp_Kpt (DefaultPairs, DotViT2Mlp): pass
